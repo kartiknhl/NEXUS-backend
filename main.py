@@ -5,6 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import logging
 
+MAX_BRANCHING_PER_NODE = 2   # Only follow the top 2 largest outbound paths per wallet
+MAX_TOTAL_GRAPH_NODES = 25   # Hard cap to prevent UI freezing
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,7 +33,7 @@ app.add_middleware(
 
 ETHERSCAN_API_KEY = "TVI3TP3ZBXTE641AP7S44FE5966N3J8ID5"
 TRON_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-
+TRONGRID_API_KEY = "d9b7c003-0ac1-4b8d-8653-0f346e368a72"
 # ---------------------------------------------------------
 # 1. KNOWN VASP REGISTRY (Centralized Exchange Hot Wallets)
 # ---------------------------------------------------------
@@ -52,10 +55,13 @@ DUST_THRESHOLD_SUN = 10**6    # 1.0 USDT
 def fetch_outbound_transactions(wallet_address: str):
     """Fetches outbound transactions across Ethereum (EVM) or Tron networks."""
     outbound = []
-    clean_addr = wallet_address.strip().lower()
+    
+    # Strip whitespace but DO NOT lowercase yet; we need original casing for Tron
+    raw_addr = wallet_address.strip()
 
-    # Route A: Ethereum (EVM)
-    if clean_addr.startswith("0x"):
+    # Route A: Ethereum (EVM) - Hex is case-insensitive, so we use lower()
+    if raw_addr.lower().startswith("0x"):
+        clean_addr = raw_addr.lower()
         url = (
             f"https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist"
             f"&address={clean_addr}&startblock=0&endblock=99999999&page=1&offset=25&sort=desc"
@@ -82,14 +88,22 @@ def fetch_outbound_transactions(wallet_address: str):
         except (ValueError, KeyError, TypeError) as e:
             logger.error(f"Etherscan response parsing failed for {clean_addr}: {e}")
 
-    # Route B: Tron Network
-    elif clean_addr.startswith("t") and len(clean_addr) == 34:
+    # Route B: Tron Network - Base58 is STRICTLY case-sensitive
+    elif raw_addr.startswith("T") and len(raw_addr) == 34:
         url = (
-            f"https://api.trongrid.io/v1/accounts/{clean_addr}/transactions/trc20"
+            f"https://api.trongrid.io/v1/accounts/{raw_addr}/transactions/trc20"
             f"?only_from=true&limit=25&contract_address={TRON_USDT_CONTRACT}"
         )
+        
+        # TronGrid requires the API key to be passed in the headers
+        headers = {
+            "TRON-PRO-API-KEY": TRONGRID_API_KEY
+        }
+        
         try:
-            res = requests.get(url, timeout=10).json()
+            # Pass the headers into the requests.get function
+            res = requests.get(url, headers=headers, timeout=10).json()
+            
             if res.get("success"):
                 for tx in res.get("data", []):
                     to_addr = tx.get("to")
@@ -97,20 +111,20 @@ def fetch_outbound_transactions(wallet_address: str):
                         val = int(tx.get("value", 0))
                         if val >= DUST_THRESHOLD_SUN:
                             outbound.append({
-                                "to": to_addr.lower(),
+                                "to": to_addr, 
                                 "value_raw": str(val),
                                 "hash": tx.get("transaction_id"),
                                 "timestamp": tx.get("block_timestamp"),
                                 "asset": "USDT"
                             })
             else:
-                logger.warning(f"TronGrid API error for {clean_addr}: {res.get('meta', {}).get('error', 'Unknown error')}")
+                logger.warning(f"TronGrid API error for {raw_addr}: {res.get('meta', {}).get('error', 'Unknown error')}")
         except requests.RequestException as e:
-            logger.error(f"TronGrid request failed for {clean_addr}: {e}")
+            logger.error(f"TronGrid request failed for {raw_addr}: {e}")
         except (ValueError, KeyError, TypeError) as e:
-            logger.error(f"TronGrid response parsing failed for {clean_addr}: {e}")
+            logger.error(f"TronGrid response parsing failed for {raw_addr}: {e}")
     else:
-        logger.warning(f"Unsupported address format: {wallet_address}")
+        logger.warning(f"Unsupported address format: {raw_addr}")
 
     return outbound
 
@@ -143,7 +157,7 @@ def trace_network(
     if not validate_wallet_address(wallet_hash):
         raise HTTPException(status_code=400, detail="Invalid wallet address format. Must be Ethereum (0x...) or Tron (T...) address.")
 
-    start_wallet = wallet_hash.strip().lower()
+    start_wallet = wallet_hash.strip()
     
     queue = deque([(start_wallet, 0)])
     visited = {start_wallet}
@@ -165,10 +179,22 @@ def trace_network(
             if hop >= max_hops:
                 continue
 
-            outbound_txs = fetch_outbound_transactions(current_wallet)
+            raw_outbound = fetch_outbound_transactions(current_wallet)
+            sorted_outbound = sorted(
+                raw_outbound,
+                key=lambda tx: int(tx.get("value_raw", 0)),
+                reverse=True
+            )
+            filtered_outbound = sorted_outbound[:MAX_BRANCHING_PER_NODE]
 
-            for tx in outbound_txs:
+            for tx in filtered_outbound:
+                if len(nodes) >= MAX_TOTAL_GRAPH_NODES:
+                    break
+
                 recipient = tx["to"]
+
+                if recipient not in visited and len(nodes) >= MAX_TOTAL_GRAPH_NODES:
+                    break
 
                 # Record Edge for Graph Visualization
                 edges.append({
@@ -210,6 +236,9 @@ def trace_network(
 
                 # Enqueue new intermediary wallet for the next hop
                 if recipient not in visited:
+                    if len(nodes) >= MAX_TOTAL_GRAPH_NODES:
+                        break
+
                     visited.add(recipient)
                     nodes.append({
                         "data": {
@@ -222,7 +251,7 @@ def trace_network(
                     queue.append((recipient, hop + 1))
 
         return {
-            "status": "TRACE_COMPLETE_NO_VASP",
+            "status": "TRACE_COMPLETE",
             "target": start_wallet,
             "hops_traversed": max_hops,
             "terminal_vasp": None,
