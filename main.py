@@ -143,6 +143,46 @@ def validate_wallet_address(address: str) -> bool:
         return True
     return False
 
+def check_vasp_identity(wallet_address: str, chain: str):
+    """
+    Dynamically checks if an address belongs to a known Exchange (VASP).
+    Uses local cache first, then queries open-source Threat Intel APIs.
+    """
+    # 1. Fast Cache Check (Your existing KNOWN_VASPS dictionary)
+    if wallet_address in KNOWN_VASPS:
+        return KNOWN_VASPS[wallet_address]
+        
+    # 2. Dynamic OSINT API Lookup (e.g., CryptoLabel Public API)
+    try:
+        network = "ethereum" if chain == "ETH" else "tron"
+        url = f"https://cryptolabel.io/api/v1/address/{network}/{wallet_address}"
+        
+        # Use a short timeout (1.5s) so the BFS traversal doesn't freeze if the API is slow
+        res = requests.get(url, timeout=1.5).json()
+        
+        # Check if the API identified this entity as an 'exchange'
+        if res.get("entity") and res["entity"].get("category") == "exchange":
+            entity_name = res["entity"].get("name", "Unknown VASP")
+            
+            # Format the label (e.g., "Exchange Cold Wallet" -> "Cold Wallet")
+            label_type = "Hot Wallet"
+            if res.get("labels") and len(res["labels"]) > 0:
+                label_type = res["labels"][0].get("type", "Wallet").replace("_", " ").title()
+            
+            new_vasp_data = {
+                "name": f"{entity_name} {label_type}",
+                "entity": entity_name
+            }
+            
+            # Cache it dynamically so we don't query it again during this trace
+            KNOWN_VASPS[wallet_address] = new_vasp_data
+            return new_vasp_data
+            
+    except Exception as e:
+        # If the OSINT API fails or times out, gracefully continue tracking as a normal mule
+        pass
+        
+    return None
 
 @app.get("/api/trace/{wallet_hash}")
 def trace_network(
@@ -209,8 +249,8 @@ def trace_network(
                 })
 
                 # Check for VASP Match
-                if recipient in KNOWN_VASPS:
-                    vasp_info = KNOWN_VASPS[recipient]
+                vasp_info = check_vasp_identity(recipient, tx["asset"])
+                if vasp_info:
                     nodes.append({
                         "data": {
                             "id": recipient,
