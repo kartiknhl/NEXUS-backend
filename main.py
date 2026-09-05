@@ -185,21 +185,27 @@ def check_vasp_identity(wallet_address: str, chain: str):
     return None
 
 @app.get("/api/trace/{wallet_hash}")
-def trace_network(
+def api_trace(
     wallet_hash: str,
-    max_hops: int = Query(default=2, ge=1, le=5, description="Maximum BFS hops (1-5)")
+    max_hops: int = Query(default=2, ge=1, le=5, description="Maximum BFS hops (1-5)"),
+    min_timestamp: int = Query(default=0, ge=0, description="Earliest transaction timestamp")
 ):
+    return trace_network(wallet_hash, max_hops, min_timestamp)
+
+
+def trace_network(start_wallet: str, max_hops: int = 2, min_timestamp: int = 0):
     """
     Executes a multi-hop Breadth-First Search (BFS) from a suspect wallet.
     Returns Cytoscape-compatible nodes and edges, terminating early upon VASP discovery.
     """
     # Input validation
-    if not validate_wallet_address(wallet_hash):
+    if not validate_wallet_address(start_wallet):
         raise HTTPException(status_code=400, detail="Invalid wallet address format. Must be Ethereum (0x...) or Tron (T...) address.")
 
-    start_wallet = wallet_hash.strip()
+    start_wallet = start_wallet.strip()
     
-    queue = deque([(start_wallet, 0)])
+    # Pass the user's min_timestamp as the chronological anchor for Hop 0
+    queue = deque([(start_wallet, 0, min_timestamp)])
     visited = {start_wallet}
 
     nodes = [{
@@ -214,14 +220,19 @@ def trace_network(
 
     try:
         while queue:
-            current_wallet, hop = queue.popleft()
+            current_wallet, hop, min_timestamp = queue.popleft()
 
             if hop >= max_hops:
                 continue
 
             raw_outbound = fetch_outbound_transactions(current_wallet)
+            # Enforce temporal causality: outbound must happen AT or AFTER inbound transfer
+            chronological_outbound = [
+                tx for tx in raw_outbound
+                if int(tx.get("timestamp", 0)) >= int(min_timestamp)
+            ]
             sorted_outbound = sorted(
-                raw_outbound,
+                chronological_outbound,
                 key=lambda tx: int(tx.get("value_raw", 0)),
                 reverse=True
             )
@@ -244,6 +255,8 @@ def trace_network(
                         "target": recipient,
                         "hash": tx["hash"],
                         "asset": tx["asset"],
+                        "value_raw": tx.get("value_raw", ""),
+                        "timestamp": tx.get("timestamp", ""),
                         "hop": hop + 1
                     }
                 })
@@ -288,7 +301,8 @@ def trace_network(
                             "hop": hop + 1
                         }
                     })
-                    queue.append((recipient, hop + 1))
+                    tx_timestamp = int(tx.get("timestamp", 0))
+                    queue.append((recipient, hop + 1, tx_timestamp))
 
         return {
             "status": "TRACE_COMPLETE",
